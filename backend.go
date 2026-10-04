@@ -54,9 +54,12 @@ type DiskBackend struct {
 	root           string
 	fault          FaultKind
 	faultRemaining int // FaultCorrupt / FaultWriteFail 的剩余次数
+	capacity       int64 // 容量预算（字节）；<=0 表示不限
+	weight         int   // 放置相对权重；<=0 视为 1
 }
 
 // NewDiskBackend 创建一个磁盘后端，root 为其专属目录（不存在则创建）。
+// 默认不限容量、权重为 1（与旧行为完全一致）。
 func NewDiskBackend(id, root string) (*DiskBackend, error) {
 	if id == "" {
 		return nil, errors.New("backend id must not be empty")
@@ -68,7 +71,42 @@ func NewDiskBackend(id, root string) (*DiskBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DiskBackend{id: id, root: abs, fault: FaultNone}, nil
+	return &DiskBackend{id: id, root: abs, fault: FaultNone, weight: 1}, nil
+}
+
+// SetCapacity 设置容量预算（字节）；<=0 表示不限容量。
+func (b *DiskBackend) SetCapacity(bytes int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.capacity = bytes
+}
+
+// Capacity 返回容量预算（<=0 表示不限）。
+func (b *DiskBackend) Capacity() int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.capacity
+}
+
+// SetWeight 设置放置相对权重；<=0 归一为 1。
+// 权重只影响分布倾向，不引入任何随机性。
+func (b *DiskBackend) SetWeight(w int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if w <= 0 {
+		w = 1
+	}
+	b.weight = w
+}
+
+// Weight 返回放置权重（>=1）。
+func (b *DiskBackend) Weight() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.weight <= 0 {
+		return 1
+	}
+	return b.weight
 }
 
 func (b *DiskBackend) ID() string { return b.id }

@@ -76,6 +76,12 @@ type Store struct {
 	// 并发同键不同载荷在写任何字节前即被判 ErrConflict，
 	// 保证冲突的失败者不会污染胜利者的版本路径。
 	pending map[string]uint32
+	// reserved 为各后端"已声明、尚未提交"的在途字节预留。
+	// 容量判定 = 已提交存活字节 + 在途预留 + 本次需求 <= 预算，
+	// 保证并发写入不会合伙超支，也不会出现"写成功但没地方放"。
+	reserved map[string]int64
+	// healEvents 记录读取路径上的自愈尝试（观测用，不影响读取结果）。
+	healEvents []HealEvent
 }
 
 // Open 打开或初始化存储层。打开时自动重放 WAL，折叠重复提交。
@@ -121,6 +127,7 @@ func Open(backends []*DiskBackend, cfg Config) (*Store, error) {
 		metaBack:  meta,
 		committed: map[string]map[int][]CommitRecord{},
 		pending:   map[string]uint32{},
+		reserved:  map[string]int64{},
 	}
 	for _, rec := range wal.Records() {
 		s.indexRecordLocked(rec)
@@ -179,6 +186,123 @@ func mergeShards(shards [][]byte, size int) []byte {
 	return out
 }
 
+// shardByteSizes 返回 size 字节的块切成 S 个分片后每个分片的字节数（确定性）。
+func shardByteSizes(size, S int) []int {
+	out := make([]int, S)
+	for i := 0; i < S; i++ {
+		n := (size - i + S - 1) / S
+		if n < 0 {
+			n = 0
+		}
+		out[i] = n
+	}
+	return out
+}
+
+// committedUsageLocked 统计当前生效提交视图在各后端上存活的字节数。
+// 该值与 GC 存活根集严格同源：已提交数据的空间不会被后续写入挤占。
+func (s *Store) committedUsageLocked() map[string]int64 {
+	used := map[string]int64{}
+	for _, blocks := range s.committed {
+		for _, recs := range blocks {
+			for _, rec := range recs {
+				sizes := shardByteSizes(rec.Size, s.cfg.Shards)
+				for _, loc := range rec.Locs {
+					if loc.Shard >= 0 && loc.Shard < len(sizes) {
+						used[loc.Backend] += int64(sizes[loc.Shard])
+					}
+				}
+			}
+		}
+	}
+	return used
+}
+
+// BackendCapacity 是单个后端的容量视图。
+type BackendCapacity struct {
+	ID        string
+	Budget    int64 // <=0 表示不限容量
+	Weight    int
+	Used      int64 // 已提交存活数据占用（与 GC 存活集合严格一致）
+	Reserved  int64 // 在途写入已预留、尚未提交的字节
+	Remaining int64 // 预算剩余；不限容量时为 -1
+}
+
+// CapacityReport 返回各后端的预算/已用/预留/剩余（按 ID 排序，确定性）。
+func (s *Store) CapacityReport() []BackendCapacity {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	used := s.committedUsageLocked()
+	ids := make([]string, 0, len(s.backends))
+	for id := range s.backends {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]BackendCapacity, 0, len(ids))
+	for _, id := range ids {
+		b := s.backends[id]
+		budget := b.Capacity()
+		rem := int64(-1)
+		if budget > 0 {
+			rem = budget - used[id] - s.reserved[id]
+		}
+		out = append(out, BackendCapacity{
+			ID: id, Budget: budget, Weight: b.Weight(),
+			Used: used[id], Reserved: s.reserved[id], Remaining: rem,
+		})
+	}
+	return out
+}
+
+// checkAndReserveLocked 在持有 s.mu 时校验并预留容量：
+// 对每个目标后端要求 已提交存活 + 在途预留 + 本次需求 <= 预算。
+// 任一后端不满足则整体失败（不写任何字节、不产生预留），
+// 返回的错误可用 errors.Is(err, ErrCapacityExhausted) 与后端不足区分。
+func (s *Store) checkAndReserveLocked(objectID string, block int, need map[string]int64) error {
+	used := s.committedUsageLocked()
+	ids := make([]string, 0, len(need))
+	for id := range need {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		b := s.backends[id]
+		if b == nil {
+			continue
+		}
+		budget := b.Capacity()
+		if budget <= 0 {
+			continue // 不限容量
+		}
+		total := used[id] + s.reserved[id] + need[id]
+		if total > budget {
+			return &PlacementError{
+				ObjectID: objectID, Block: block, Shard: -1,
+				Want: s.cfg.Replicas, Healthy: len(s.backends),
+				Cause: ErrCapacityExhausted,
+				Decision: fmt.Sprintf("preflight capacity: backend=%s budget=%d used=%d reserved=%d need=%d -> %d > %d; abort before any shard write",
+					id, budget, used[id], s.reserved[id], need[id], total, budget),
+			}
+		}
+	}
+	for id, n := range need {
+		s.reserved[id] += n
+	}
+	return nil
+}
+
+// unreserve 释放一次容量预留（提交成功或写入中止后调用）。
+func (s *Store) unreserve(need map[string]int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, n := range need {
+		s.reserved[id] -= n
+		if s.reserved[id] <= 0 {
+			delete(s.reserved, id)
+		}
+	}
+}
+
 // writeBlock 将一个逻辑块条带化、多副本并行写出，全部成功后原子提交。
 //
 // 整个块写入期间持有 opMu 读锁：多个写入者仍可并发，但 GC / 恢复这类
@@ -207,6 +331,14 @@ func (s *Store) writeBlock(objectID string, block int, data []byte, opts WriteOp
 	//    - 在途同键同 CRC：视为并发幂等重试，直接返回，由先声明者完成。
 	sum := crc32.ChecksumIEEE(data)
 	key := CommitRecord{ObjectID: objectID, Block: block, Version: opts.Version, Writer: opts.Writer}.Key()
+	// 本次写入对各后端的容量需求（按确定性布局汇总分片字节数）。
+	sizes := shardByteSizes(len(data), s.cfg.Shards)
+	need := map[string]int64{}
+	for si := range layout.Shards {
+		for _, pl := range layout.Shards[si] {
+			need[pl.Backend] += int64(sizes[si])
+		}
+	}
 	s.mu.Lock()
 	for _, rec := range s.committed[objectID][block] {
 		if rec.Key() == key {
@@ -224,11 +356,23 @@ func (s *Store) writeBlock(objectID string, block int, data []byte, opts WriteOp
 		}
 		return fmt.Errorf("%w: in-flight object=%s block=%d v=%d writer=%s", ErrConflict, objectID, block, opts.Version, opts.Writer)
 	}
+	// 容量预检：在写任何字节之前，确认所有目标后端都放得下。
+	// 与"健康后端不足"（ErrReplicaShortage）可区分地报 ErrCapacityExhausted。
+	if err := s.checkAndReserveLocked(objectID, block, need); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.pending[key] = sum
 	s.mu.Unlock()
 	release := func() {
 		s.mu.Lock()
 		delete(s.pending, key)
+		for id, n := range need {
+			s.reserved[id] -= n
+			if s.reserved[id] <= 0 {
+				delete(s.reserved, id)
+			}
+		}
 		s.mu.Unlock()
 	}
 
@@ -304,6 +448,13 @@ func (s *Store) writeBlock(objectID string, block int, data []byte, opts WriteOp
 	}
 	s.mu.Lock()
 	delete(s.pending, key)
+	// 预留转为已提交占用：committed 视图从现在开始计入这些字节。
+	for id, n := range need {
+		s.reserved[id] -= n
+		if s.reserved[id] <= 0 {
+			delete(s.reserved, id)
+		}
+	}
 	s.indexRecordLocked(rec)
 	s.mu.Unlock()
 	return nil
@@ -403,21 +554,30 @@ func (s *Store) readBlock(rec CommitRecord) ([]byte, error) {
 		sort.Ints(repOrder)
 		var got []byte
 		var lastErr error
+		type failedLoc struct {
+			replica int
+			backend string
+			reason  string
+		}
+		var failed []failedLoc
 		for _, r := range repOrder {
 			backID := reps[r]
 			back := s.backends[backID]
 			path := VersionedShardPath(rec.ObjectID, rec.Block, si, r, rec.Version, rec.Writer)
 			if back == nil {
 				lastErr = fmt.Errorf("shard=%d replica=%d backend=%s: backend not configured", si, r, backID)
+				failed = append(failed, failedLoc{r, backID, "backend not configured"})
 				continue
 			}
 			data, err := back.Read(path)
 			if err != nil {
 				lastErr = fmt.Errorf("shard=%d replica=%d backend=%s: %w", si, r, backID, err)
+				failed = append(failed, failedLoc{r, backID, err.Error()})
 				continue
 			}
 			if crc32.ChecksumIEEE(data) != rec.ShardCRC[si] {
 				lastErr = fmt.Errorf("shard=%d replica=%d backend=%s: shard crc mismatch (silent corruption)", si, r, backID)
+				failed = append(failed, failedLoc{r, backID, "shard crc mismatch"})
 				continue
 			}
 			got = data
@@ -427,6 +587,23 @@ func (s *Store) readBlock(rec CommitRecord) ([]byte, error) {
 			degraded = append(degraded, fmt.Errorf("%w: object=%s block=%d shard=%d: %v",
 				ErrBlockDegraded, rec.ObjectID, rec.Block, si, lastErr))
 			continue
+		}
+		// 读取自愈：分片已由完好副本重建，顺手把完好字节补写回
+		// 缺失/损坏的固定位置（同后端同路径，布局不变）。
+		// 补写失败只记录事件，绝不影响本次读取结果。
+		for _, f := range failed {
+			ev := HealEvent{
+				ObjectID: rec.ObjectID, Block: rec.Block, Shard: si, Replica: f.replica,
+				Backend: f.backend,
+				Path:    VersionedShardPath(rec.ObjectID, rec.Block, si, f.replica, rec.Version, rec.Writer),
+				Trigger: f.reason,
+			}
+			if herr := s.repairReplica(rec, si, f.replica, f.backend, got); herr != nil {
+				ev.Err = herr.Error()
+			} else {
+				ev.Repaired = true
+			}
+			s.recordHeal(ev)
 		}
 		shards[si] = got
 	}
@@ -527,7 +704,7 @@ func (s *Store) DescribeLayout(objectID string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "object=%s S=%d R=%d blocks=%d blockSize=%d visible=v%d/writer=%s\n",
 		objectID, s.cfg.Shards, s.cfg.Replicas, nBlocks, s.cfg.BlockSize, k.Version, k.Writer)
-	sb.WriteString("placement rule: shard s replicas at ring[(FNV1a(obj,b,s)+r) mod N] on healthy backend ring sorted by id; locations frozen in commit record\n")
+	sb.WriteString("placement rule: shard s replicas at weightedRing[(FNV1a(obj,b,s)+r) mod W] (ring expanded by per-backend weight, deterministic skip to distinct backend) on healthy backends sorted by id; locations frozen in commit record\n")
 	for b := 0; b < nBlocks; b++ {
 		rec, ok := s.recordFor(objectID, b, k)
 		if !ok {
@@ -572,3 +749,57 @@ func (s *Store) replaceCommitted(records []CommitRecord) {
 
 // Backend 按 ID 返回后端实例（测试用于故障注入与检查）。
 func (s *Store) Backend(id string) *DiskBackend { return s.backends[id] }
+
+// BackendIDs 返回当前后端 ID（排序，确定性）。
+func (s *Store) BackendIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.backends))
+	for id := range s.backends {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// AddBackend 在运行中加入一个新后端。
+// 只扩容、不搬迁：已有提交记录的位置不变，读取与恢复流程完全兼容；
+// 新写入立即使用包含新后端的确定性布局。旧数据的搬迁由 Rebalance 完成。
+// 持有 opMu 写锁，与写入/GC/恢复互斥，保证规划器切换是原子的。
+func (s *Store) AddBackend(b *DiskBackend) error {
+	if b == nil || b.id == "" {
+		return errors.New("store: backend must have non-empty id")
+	}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, dup := s.backends[b.id]; dup {
+		return fmt.Errorf("store: duplicate backend id %q", b.id)
+	}
+	s.backends[b.id] = b
+	all := make([]*DiskBackend, 0, len(s.backends))
+	for _, back := range s.backends {
+		all = append(all, back)
+	}
+	s.planner = NewPlanner(all, s.cfg.Shards, s.cfg.Replicas)
+	return nil
+}
+
+// applyRelocation 把一条重定位记录落到 WAL 并更新内存提交视图。
+// 调用方必须保证：新位置上的副本已经完整落盘并通过 CRC 校验，
+// 否则提交视图会指向不存在的数据（本包内仅 Rebalance 满足该前置条件）。
+func (s *Store) applyRelocation(rec CommitRecord) error {
+	if err := s.wal.Append(rec); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs := s.committed[rec.ObjectID][rec.Block]
+	for i := range recs {
+		if recs[i].Key() == rec.Key() {
+			recs[i].Locs = append([]ReplicaLoc(nil), rec.Locs...)
+		}
+	}
+	return nil
+}

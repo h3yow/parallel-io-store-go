@@ -12,6 +12,9 @@ import (
 var (
 	// ErrReplicaShortage 可用后端数量不足以放置要求的副本数。
 	ErrReplicaShortage = errors.New("replica shortage: not enough distinct healthy backends")
+	// ErrCapacityExhausted 目标后端容量预算不足以容纳新副本。
+	// 与 ErrReplicaShortage 可区分：前者是"位置够但放不下"，后者是"健康后端不够"。
+	ErrCapacityExhausted = errors.New("capacity exhausted: backend budget cannot fit new replicas")
 	// ErrBackendUnavailable 指定后端当前不可用（被故障注入下线等）。
 	ErrBackendUnavailable = errors.New("backend unavailable")
 	// ErrShardWriteFailed 某个分片副本写入失败（中途故障）。

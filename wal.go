@@ -35,6 +35,16 @@ type ReplicaLoc struct {
 	Backend string
 }
 
+// 记录种类。
+const (
+	// KindData 普通数据提交（默认，零值；旧格式日志全部视为该种）。
+	KindData = 0
+	// KindReloc 重定位提交：与同一 Key 的数据记录载荷完全一致，
+	// 仅更新副本位置（重平衡搬迁后追加）。重放时折叠为
+	// "原数据记录 + 新位置"，因此重启后布局仍然收敛。
+	KindReloc = 1
+)
+
 // CommitRecord 是一条块提交记录。
 type CommitRecord struct {
 	ObjectID string
@@ -45,6 +55,7 @@ type CommitRecord struct {
 	Checksum uint32       // 块原始（重编码后）数据的 CRC32-IEEE
 	ShardCRC []uint32     // 每个分片内容的 CRC32，顺序与分片号一致
 	Locs     []ReplicaLoc // 每个 (分片, 副本) 提交时所在后端
+	Kind     int          // KindData / KindReloc（零值为 KindData，向后兼容）
 }
 
 // Key 返回幂等去重键。
@@ -64,6 +75,20 @@ func (r CommitRecord) equalPayload(o CommitRecord) bool {
 	}
 	for i := range r.Locs {
 		if r.Locs[i] != o.Locs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// samePayloadIdentity 判断两条记录是否描述同一份数据（忽略副本位置）。
+// 重定位记录必须满足该判定，否则视为冲突。
+func (r CommitRecord) samePayloadIdentity(o CommitRecord) bool {
+	if r.Size != o.Size || r.Checksum != o.Checksum || len(r.ShardCRC) != len(o.ShardCRC) {
+		return false
+	}
+	for i := range r.ShardCRC {
+		if r.ShardCRC[i] != o.ShardCRC[i] {
 			return false
 		}
 	}
@@ -165,6 +190,9 @@ func (r CommitRecord) encodeTLV() []byte {
 		buf.Write(nb[:])
 		buf.WriteString(loc.Backend)
 	}
+	if r.Kind != KindData {
+		putU64(9, uint64(r.Kind)) // 可选字段：旧格式记录无此 tag，解码默认 KindData
+	}
 	return buf.Bytes()
 }
 
@@ -242,6 +270,12 @@ func decodeTLV(p []byte) (CommitRecord, error) {
 				Replica: int(binary.LittleEndian.Uint32(hdr[4:8])),
 				Backend: string(name),
 			})
+		case 9:
+			b, err := take(8)
+			if err != nil {
+				return r, err
+			}
+			r.Kind = int(binary.LittleEndian.Uint64(b))
 		default:
 			return r, fmt.Errorf("unknown TLV tag %d", tag[0])
 		}
@@ -252,17 +286,8 @@ func decodeTLV(p []byte) (CommitRecord, error) {
 	return r, nil
 }
 
-// Append 追加一条提交记录。相同 Key 且载荷相同则幂等返回；
-// 相同 Key 不同载荷返回 ErrConflict（确定性，不写入）。
-func (w *CommitWAL) Append(rec CommitRecord) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if old, ok := w.seen[rec.Key()]; ok {
-		if !old.equalPayload(rec) {
-			return fmt.Errorf("%w: key=%s", ErrConflict, rec.Key())
-		}
-		return nil
-	}
+// appendFrame 把一条记录编码为帧并原子追加到日志文件（调用方需持锁）。
+func (w *CommitWAL) appendFrame(rec CommitRecord) error {
 	payload := rec.encodeTLV()
 	var frame bytes.Buffer
 	frame.WriteString("PWAL")
@@ -278,7 +303,46 @@ func (w *CommitWAL) Append(rec CommitRecord) error {
 	// 要么含全部新帧，不会出现撕裂尾帧（重放时撕裂帧被安全忽略）。
 	old, _ := w.back.Read(w.path)
 	combined := append(append([]byte(nil), old...), frame.Bytes()...)
-	if err := w.back.Write(w.path, combined); err != nil {
+	return w.back.Write(w.path, combined)
+}
+
+// Append 追加一条提交记录。相同 Key 且载荷相同则幂等返回；
+// 相同 Key 不同载荷返回 ErrConflict（确定性，不写入）。
+// KindReloc 记录要求同 Key 数据记录已存在且载荷身份一致，
+// 追加后折叠生效：内存与重放视图中的副本位置被替换为新位置。
+func (w *CommitWAL) Append(rec CommitRecord) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if old, ok := w.seen[rec.Key()]; ok {
+		if rec.Kind == KindReloc {
+			if !old.samePayloadIdentity(rec) {
+				return fmt.Errorf("%w: reloc payload mismatch key=%s", ErrConflict, rec.Key())
+			}
+			if old.equalPayload(rec) {
+				return nil // 位置已一致：幂等
+			}
+			if err := w.appendFrame(rec); err != nil {
+				return err
+			}
+			merged := old
+			merged.Locs = append([]ReplicaLoc(nil), rec.Locs...)
+			w.seen[rec.Key()] = merged
+			for i := range w.records {
+				if w.records[i].Key() == rec.Key() {
+					w.records[i] = merged
+				}
+			}
+			return nil
+		}
+		if !old.equalPayload(rec) {
+			return fmt.Errorf("%w: key=%s", ErrConflict, rec.Key())
+		}
+		return nil
+	}
+	if rec.Kind == KindReloc {
+		return fmt.Errorf("wal: reloc record for unknown key=%s", rec.Key())
+	}
+	if err := w.appendFrame(rec); err != nil {
 		return err
 	}
 	w.seen[rec.Key()] = rec
@@ -302,7 +366,7 @@ func (w *CommitWAL) replayBytes() ([]CommitRecord, int, error) {
 		}
 		return nil, 0, nil // 文件尚不存在
 	}
-	seen := map[string]CommitRecord{}
+	seen := map[string]int{} // key -> out 下标
 	var out []CommitRecord
 	i := 0
 	for i < len(data) {
@@ -323,12 +387,27 @@ func (w *CommitWAL) replayBytes() ([]CommitRecord, int, error) {
 		if err != nil {
 			break
 		}
-		if old, ok := seen[rec.Key()]; ok {
-			if !old.equalPayload(rec) {
+		if rec.Kind == KindReloc {
+			// 重定位帧：折叠进已存在的同 Key 数据记录（仅更新位置）。
+			// 找不到基记录说明日志曾被截断，忽略该帧（旧位置仍是存活集，
+			// 多余的新位置副本由 GC 回收，语义保持安全）。
+			if idx, ok := seen[rec.Key()]; ok {
+				base := out[idx]
+				if !base.samePayloadIdentity(rec) {
+					return nil, 0, fmt.Errorf("%w: conflicting on-disk reloc key=%s", ErrConflict, rec.Key())
+				}
+				base.Locs = append([]ReplicaLoc(nil), rec.Locs...)
+				out[idx] = base
+			}
+			i = end
+			continue
+		}
+		if idx, ok := seen[rec.Key()]; ok {
+			if !out[idx].equalPayload(rec) {
 				return nil, 0, fmt.Errorf("%w: conflicting on-disk records key=%s", ErrConflict, rec.Key())
 			}
 		} else {
-			seen[rec.Key()] = rec
+			seen[rec.Key()] = len(out)
 			out = append(out, rec)
 		}
 		i = end

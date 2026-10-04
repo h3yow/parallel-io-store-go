@@ -74,18 +74,32 @@ func shardStartHash(objectID string, block, shard int) uint32 {
 
 // BlockLayout 基于给定的有序后端环计算指定块的布局（纯函数）。
 // 调用方负责保证 ring 只包含健康后端；副本数不足时返回 PlacementError。
+//
+// 权重规则：先把环按"ID 升序、每个后端重复 weight 次"展开成加权环，
+// 再按 (h(obj,block,shard)+r) 在加权环上取槽位；若槽位对应的后端在本
+// 分片内已被选中，则确定性地顺移到下一个未使用的后端，保证 R 个副本
+// 落在互不相同的后端上。所有权重为 1 时展开环与原环完全一致，
+// 布局与旧版本逐位相同（向后兼容）。权重只改变命中槽位的概率分布，
+// 整个过程无任何随机性：同一输入永远得到同一布局。
 func (p *Planner) BlockLayout(objectID string, block int, ring []*DiskBackend) (Layout, error) {
 	if len(ring) < p.r {
 		return Layout{}, &PlacementError{
 			ObjectID: objectID, Block: block,
 			Shard: -1, Want: p.r, Healthy: len(ring),
 			Cause:    ErrReplicaShortage,
-			Decision: fmt.Sprintf("rule: shard s replica r -> backend[ring[(h(obj,b,s)+r) mod N])]; N=%d healthy backends < R=%d", len(ring), p.r),
+			Decision: fmt.Sprintf("rule: shard s replica r -> weightedRing[(h(obj,b,s)+r) mod W] with deterministic skip to distinct backend; N=%d healthy backends < R=%d", len(ring), p.r),
 		}
 	}
 	ids := make([]string, len(ring))
 	for i, b := range ring {
 		ids[i] = b.id
+	}
+	// 展开加权环：按 ID 升序，每个后端重复 weight 次（确定性）。
+	var expanded []*DiskBackend
+	for _, b := range ring {
+		for w := 0; w < b.Weight(); w++ {
+			expanded = append(expanded, b)
+		}
 	}
 	lay := Layout{
 		ObjectID: objectID, Block: block,
@@ -93,15 +107,33 @@ func (p *Planner) BlockLayout(objectID string, block int, ring []*DiskBackend) (
 		Backends: ids, S: p.s, R: p.r,
 	}
 	for sIdx := 0; sIdx < p.s; sIdx++ {
-		start := int(shardStartHash(objectID, block, sIdx) % uint32(len(ring)))
+		start := int(shardStartHash(objectID, block, sIdx) % uint32(len(expanded)))
 		lay.Shards[sIdx] = make([]Placement, p.r)
+		used := map[string]bool{}
 		for rIdx := 0; rIdx < p.r; rIdx++ {
-			bi := (start + rIdx) % len(ring)
+			// 从 (start+rIdx) 起顺移到本分片尚未使用的后端（确定性去重）。
+			var pick *DiskBackend
+			for off := rIdx; off < len(expanded); off++ {
+				cand := expanded[(start+off)%len(expanded)]
+				if !used[cand.id] {
+					pick = cand
+					break
+				}
+			}
+			if pick == nil {
+				return Layout{}, &PlacementError{
+					ObjectID: objectID, Block: block, Shard: sIdx,
+					Want: p.r, Healthy: len(ring),
+					Cause:    ErrReplicaShortage,
+					Decision: "weighted ring exhausted without finding distinct backend",
+				}
+			}
+			used[pick.id] = true
 			lay.Shards[sIdx][rIdx] = Placement{
 				Block:   block,
 				Shard:   sIdx,
 				Replica: rIdx,
-				Backend: ring[bi].id,
+				Backend: pick.id,
 				Path:    ShardPath(objectID, block, sIdx, rIdx),
 			}
 		}
