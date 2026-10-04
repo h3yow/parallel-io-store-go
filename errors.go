@@ -28,6 +28,8 @@ var (
 	ErrNoCheckpoint = errors.New("no valid checkpoint")
 	// ErrObjectNotFound 对象不存在。
 	ErrObjectNotFound = errors.New("object not found")
+	// ErrCapacityExhausted 可用后端的容量预算放不下本次写入的全部副本。
+	ErrCapacityExhausted = errors.New("capacity exhausted: replicas do not fit within backend budgets")
 )
 
 // PlacementError 描述副本放置阶段的失败原因。

@@ -76,6 +76,12 @@ type Store struct {
 	// 并发同键不同载荷在写任何字节前即被判 ErrConflict，
 	// 保证冲突的失败者不会污染胜利者的版本路径。
 	pending map[string]uint32
+	// reserved 为后端 ID -> 在途写入已预留、尚未提交的字节数。
+	// 预留在容量预检通过时建立、提交或失败时释放，保证并发写入
+	// 不会把已承诺给他人的容量重复花掉（已提交数据绝不被挤占）。
+	reserved map[string]int64
+	// repairs 记录读取自愈与巡检的补写事件（成功与失败都留痕）。
+	repairs []RepairEvent
 }
 
 // Open 打开或初始化存储层。打开时自动重放 WAL，折叠重复提交。
@@ -121,6 +127,7 @@ func Open(backends []*DiskBackend, cfg Config) (*Store, error) {
 		metaBack:  meta,
 		committed: map[string]map[int][]CommitRecord{},
 		pending:   map[string]uint32{},
+		reserved:  map[string]int64{},
 	}
 	for _, rec := range wal.Records() {
 		s.indexRecordLocked(rec)
@@ -196,15 +203,15 @@ func (s *Store) writeBlock(objectID string, block int, data []byte, opts WriteOp
 			Decision: "preflight: healthy backend count < required replica factor R; abort before any shard write",
 		}
 	}
-	layout, err := s.planner.BlockLayout(objectID, block, ring)
-	if err != nil {
-		return err
-	}
-	// 2) 计算载荷 CRC，并在写任何字节前声明块键：
+	need := shardSizes(len(data), s.cfg.Shards)
+	// 2) 计算载荷 CRC，并在写任何字节前声明块键 + 做容量预检与预留
+	//    （与冲突检查同一把锁，保证并发写入不会重复花费同一份容量）：
 	//    - 已提交同键同 CRC：幂等成功，直接返回；
 	//    - 已提交同键不同 CRC：ErrConflict；
 	//    - 在途同键不同 CRC：ErrConflict（冲突方不会互相覆盖版本路径）；
-	//    - 在途同键同 CRC：视为并发幂等重试，直接返回，由先声明者完成。
+	//    - 在途同键同 CRC：视为并发幂等重试，直接返回，由先声明者完成；
+	//    - 预算内放不下：ErrCapacityExhausted（与后端不足可区分），
+	//      此时尚未写任何字节。
 	sum := crc32.ChecksumIEEE(data)
 	key := CommitRecord{ObjectID: objectID, Block: block, Version: opts.Version, Writer: opts.Writer}.Key()
 	s.mu.Lock()
@@ -224,11 +231,18 @@ func (s *Store) writeBlock(objectID string, block int, data []byte, opts WriteOp
 		}
 		return fmt.Errorf("%w: in-flight object=%s block=%d v=%d writer=%s", ErrConflict, objectID, block, opts.Version, opts.Writer)
 	}
+	layout, err := s.planner.BlockLayoutWithCapacity(objectID, block, ring, need, s.availableLocked())
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.pending[key] = sum
+	s.reserveLocked(layout, need)
 	s.mu.Unlock()
 	release := func() {
 		s.mu.Lock()
 		delete(s.pending, key)
+		s.releaseReservedLocked(layout, need)
 		s.mu.Unlock()
 	}
 
@@ -304,6 +318,7 @@ func (s *Store) writeBlock(objectID string, block int, data []byte, opts WriteOp
 	}
 	s.mu.Lock()
 	delete(s.pending, key)
+	s.releaseReservedLocked(layout, need) // 提交后由已提交记账接管占用
 	s.indexRecordLocked(rec)
 	s.mu.Unlock()
 	return nil
@@ -403,21 +418,25 @@ func (s *Store) readBlock(rec CommitRecord) ([]byte, error) {
 		sort.Ints(repOrder)
 		var got []byte
 		var lastErr error
+		var failed []failedLoc
 		for _, r := range repOrder {
 			backID := reps[r]
 			back := s.backends[backID]
 			path := VersionedShardPath(rec.ObjectID, rec.Block, si, r, rec.Version, rec.Writer)
 			if back == nil {
 				lastErr = fmt.Errorf("shard=%d replica=%d backend=%s: backend not configured", si, r, backID)
+				failed = append(failed, failedLoc{replica: r, backend: backID, path: path, err: lastErr})
 				continue
 			}
 			data, err := back.Read(path)
 			if err != nil {
 				lastErr = fmt.Errorf("shard=%d replica=%d backend=%s: %w", si, r, backID, err)
+				failed = append(failed, failedLoc{replica: r, backend: backID, path: path, err: lastErr})
 				continue
 			}
 			if crc32.ChecksumIEEE(data) != rec.ShardCRC[si] {
 				lastErr = fmt.Errorf("shard=%d replica=%d backend=%s: shard crc mismatch (silent corruption)", si, r, backID)
+				failed = append(failed, failedLoc{replica: r, backend: backID, path: path, err: lastErr})
 				continue
 			}
 			got = data
@@ -427,6 +446,11 @@ func (s *Store) readBlock(rec CommitRecord) ([]byte, error) {
 			degraded = append(degraded, fmt.Errorf("%w: object=%s block=%d shard=%d: %v",
 				ErrBlockDegraded, rec.ObjectID, rec.Block, si, lastErr))
 			continue
+		}
+		// 读取自愈：分片已由其它副本重建成功，把完好字节补写回
+		// 本次失败的位置（既定路径，不改布局）；失败仅记录。
+		if len(failed) > 0 {
+			s.healReplicas(rec, si, failed, got)
 		}
 		shards[si] = got
 	}

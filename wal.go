@@ -54,7 +54,14 @@ func (r CommitRecord) Key() string {
 
 // equalPayload 判断两条同 Key 记录的载荷是否一致（幂等 vs 冲突的判定依据）。
 func (r CommitRecord) equalPayload(o CommitRecord) bool {
-	if r.Size != o.Size || r.Checksum != o.Checksum || len(r.ShardCRC) != len(o.ShardCRC) || len(r.Locs) != len(o.Locs) {
+	return r.equalExceptLocs(o) && equalLocs(r.Locs, o.Locs)
+}
+
+// equalExceptLocs 判断两条同 Key 记录除副本位置外的载荷是否一致。
+// 重平衡只改变 Locs（内容、校验和、分片 CRC 均不变），
+// 因此"同 Key + 仅 Locs 不同"是合法的位置取代，而不是冲突。
+func (r CommitRecord) equalExceptLocs(o CommitRecord) bool {
+	if r.Size != o.Size || r.Checksum != o.Checksum || len(r.ShardCRC) != len(o.ShardCRC) {
 		return false
 	}
 	for i := range r.ShardCRC {
@@ -62,8 +69,15 @@ func (r CommitRecord) equalPayload(o CommitRecord) bool {
 			return false
 		}
 	}
-	for i := range r.Locs {
-		if r.Locs[i] != o.Locs[i] {
+	return true
+}
+
+func equalLocs(a, b []ReplicaLoc) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -263,6 +277,48 @@ func (w *CommitWAL) Append(rec CommitRecord) error {
 		}
 		return nil
 	}
+	if err := w.appendFrameLocked(rec); err != nil {
+		return err
+	}
+	w.seen[rec.Key()] = rec
+	w.records = append(w.records, rec)
+	return nil
+}
+
+// Relocate 追加一条"同 Key、仅副本位置（Locs）不同"的记录：
+// 重平衡把副本搬到新后端并校验通过后，用它原子切换该块的生效位置。
+// 内容载荷（大小/校验和/分片 CRC）必须完全一致，否则返回 ErrConflict；
+// 重放时后出现的记录取代先出现者的位置，因此中断后重放依然收敛。
+func (w *CommitWAL) Relocate(rec CommitRecord) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	old, ok := w.seen[rec.Key()]
+	if !ok {
+		return fmt.Errorf("wal relocate: no committed record for key=%s", rec.Key())
+	}
+	if !old.equalExceptLocs(rec) {
+		return fmt.Errorf("%w: relocate changes payload key=%s", ErrConflict, rec.Key())
+	}
+	if old.equalPayload(rec) {
+		return nil // 位置也一致：幂等
+	}
+	if err := w.appendFrameLocked(rec); err != nil {
+		return err
+	}
+	for i := range w.records {
+		if w.records[i].Key() == rec.Key() {
+			w.records[i] = rec
+			break
+		}
+	}
+	w.seen[rec.Key()] = rec
+	return nil
+}
+
+// appendFrameLocked 把一条记录编码为帧并原子并入日志文件（调用方持有 w.mu）。
+// 用"读全量 + 追加后原子重写"的方式保证崩溃时日志文件要么含旧帧、
+// 要么含全部新帧，不会出现撕裂尾帧（重放时撕裂帧被安全忽略）。
+func (w *CommitWAL) appendFrameLocked(rec CommitRecord) error {
 	payload := rec.encodeTLV()
 	var frame bytes.Buffer
 	frame.WriteString("PWAL")
@@ -274,16 +330,9 @@ func (w *CommitWAL) Append(rec CommitRecord) error {
 	binary.LittleEndian.PutUint32(cb[:], crc32.Checksum(payload, castagnoli))
 	frame.Write(cb[:])
 
-	// 用"读全量 + 追加后原子重写"的方式保证崩溃时日志文件要么含旧帧、
-	// 要么含全部新帧，不会出现撕裂尾帧（重放时撕裂帧被安全忽略）。
 	old, _ := w.back.Read(w.path)
 	combined := append(append([]byte(nil), old...), frame.Bytes()...)
-	if err := w.back.Write(w.path, combined); err != nil {
-		return err
-	}
-	w.seen[rec.Key()] = rec
-	w.records = append(w.records, rec)
-	return nil
+	return w.back.Write(w.path, combined)
 }
 
 // Replay 读取全部记录，按 Key 折叠重复项；
@@ -303,6 +352,7 @@ func (w *CommitWAL) replayBytes() ([]CommitRecord, int, error) {
 		return nil, 0, nil // 文件尚不存在
 	}
 	seen := map[string]CommitRecord{}
+	index := map[string]int{}
 	var out []CommitRecord
 	i := 0
 	for i < len(data) {
@@ -324,11 +374,19 @@ func (w *CommitWAL) replayBytes() ([]CommitRecord, int, error) {
 			break
 		}
 		if old, ok := seen[rec.Key()]; ok {
-			if !old.equalPayload(rec) {
+			switch {
+			case old.equalPayload(rec):
+				// 完全重复：幂等折叠
+			case old.equalExceptLocs(rec):
+				// 重平衡的位置取代：后出现的记录生效
+				out[index[rec.Key()]] = rec
+				seen[rec.Key()] = rec
+			default:
 				return nil, 0, fmt.Errorf("%w: conflicting on-disk records key=%s", ErrConflict, rec.Key())
 			}
 		} else {
 			seen[rec.Key()] = rec
+			index[rec.Key()] = len(out)
 			out = append(out, rec)
 		}
 		i = end

@@ -54,6 +54,8 @@ type DiskBackend struct {
 	root           string
 	fault          FaultKind
 	faultRemaining int // FaultCorrupt / FaultWriteFail 的剩余次数
+	budget         int64
+	weight         int
 }
 
 // NewDiskBackend 创建一个磁盘后端，root 为其专属目录（不存在则创建）。
@@ -68,7 +70,7 @@ func NewDiskBackend(id, root string) (*DiskBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DiskBackend{id: id, root: abs, fault: FaultNone}, nil
+	return &DiskBackend{id: id, root: abs, fault: FaultNone, weight: 1}, nil
 }
 
 func (b *DiskBackend) ID() string { return b.id }

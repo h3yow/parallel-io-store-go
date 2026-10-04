@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Placement 是一个分片副本的放置决策。
@@ -36,17 +37,32 @@ type Layout struct {
 
 // Planner 负责确定性地计算分片布局。
 type Planner struct {
-	all      []*DiskBackend // 构造时给定，按 ID 排序
-	backends []*DiskBackend // all 的别名，语义见 HealthyBackends
-	s        int            // 每块分片数
-	r        int            // 每分片副本数
+	mu  sync.RWMutex
+	all []*DiskBackend // 构造时给定、按 ID 排序；AddBackend 插入后仍有序
+	s   int            // 每块分片数
+	r   int            // 每分片副本数
 }
 
 // NewPlanner 创建放置规划器。
 func NewPlanner(backends []*DiskBackend, shards, replicas int) *Planner {
 	sorted := append([]*DiskBackend(nil), backends...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].id < sorted[j].id })
-	return &Planner{all: sorted, backends: sorted, s: shards, r: replicas}
+	return &Planner{all: sorted, s: shards, r: replicas}
+}
+
+// AddBackend 把新后端插入规划器视图（保持 ID 有序；重复 ID 返回错误）。
+// 只影响之后的放置计算，不触碰任何已提交记录。
+func (p *Planner) AddBackend(b *DiskBackend) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ex := range p.all {
+		if ex.id == b.id {
+			return fmt.Errorf("planner: duplicate backend id %q", b.id)
+		}
+	}
+	p.all = append(p.all, b)
+	sort.Slice(p.all, func(i, j int) bool { return p.all[i].id < p.all[j].id })
+	return nil
 }
 
 // S 返回每块分片数。
@@ -72,16 +88,76 @@ func shardStartHash(objectID string, block, shard int) uint32 {
 	return h.Sum32()
 }
 
+// weightedRing 把有序健康环按相对权重展开为"加权环"：
+// 每个后端按其权重出现多次，采用平滑加权轮转（smooth weighted
+// round-robin）交错，使同一后端的副本在环上均匀散开、避免聚集。
+// 当所有权重都为 1 时，加权环与原环逐元素相同 —— 因此未配置权重的
+// 旧部署布局逐位不变（向后兼容）；权重只改变分布倾向，不引入任何随机性。
+func weightedRing(ring []*DiskBackend) []*DiskBackend {
+	weights := make([]int, len(ring))
+	current := make([]int, len(ring))
+	total := 0
+	for i, b := range ring {
+		_, w := b.Capacity()
+		if w < 1 {
+			w = 1
+		}
+		weights[i] = w
+		total += w
+	}
+	expanded := make([]*DiskBackend, 0, total)
+	for len(expanded) < total {
+		best := -1
+		for i := range ring {
+			current[i] += weights[i]
+			if best == -1 || current[i] > current[best] {
+				best = i
+			}
+		}
+		current[best] -= total
+		expanded = append(expanded, ring[best])
+	}
+	return expanded
+}
+
 // BlockLayout 基于给定的有序后端环计算指定块的布局（纯函数）。
-// 调用方负责保证 ring 只包含健康后端；副本数不足时返回 PlacementError。
+// 等价于 BlockLayoutWithCapacity 传入"无容量约束"。
 func (p *Planner) BlockLayout(objectID string, block int, ring []*DiskBackend) (Layout, error) {
+	return p.BlockLayoutWithCapacity(objectID, block, ring, nil, nil)
+}
+
+// BlockLayoutWithCapacity 在确定性规则上叠加容量约束计算块布局：
+//
+//   - need[shard] 为该分片单个副本的字节数；nil 表示不关心容量；
+//   - avail 为后端 ID -> 剩余可用字节（<0 表示不限）；nil 表示全部不限；
+//   - 选择规则：分片 s 从加权环位置 h(obj,block,s) mod L 起顺序扫描一整圈，
+//     依次挑出 R 个"互不相同且剩余容量足够"的后端；同一块内先被选中的
+//     分片会消耗对应后端的剩余容量（按分片号顺序，确定性）；
+//   - 全部权重为 1 且无容量约束时，结果与旧规则 ring[(h+r) mod N] 完全一致；
+//   - 健康后端数 < R 时失败原因为 ErrReplicaShortage；后端数量足够但
+//     预算内放不下时为 ErrCapacityExhausted —— 两者可区分。
+func (p *Planner) BlockLayoutWithCapacity(objectID string, block int, ring []*DiskBackend, need []int64, avail map[string]int64) (Layout, error) {
 	if len(ring) < p.r {
 		return Layout{}, &PlacementError{
 			ObjectID: objectID, Block: block,
 			Shard: -1, Want: p.r, Healthy: len(ring),
 			Cause:    ErrReplicaShortage,
-			Decision: fmt.Sprintf("rule: shard s replica r -> backend[ring[(h(obj,b,s)+r) mod N])]; N=%d healthy backends < R=%d", len(ring), p.r),
+			Decision: fmt.Sprintf("rule: shard s replica r -> first R distinct backends with enough budget on weighted ring from (h(obj,b,s)) ; N=%d healthy backends < R=%d", len(ring), p.r),
 		}
+	}
+	expanded := weightedRing(ring)
+	L := len(expanded)
+	// 本块内已消耗的容量（在 avail 基础上递减，确定性）。
+	consumed := map[string]int64{}
+	fits := func(id string, bytes int64) bool {
+		if avail == nil || need == nil {
+			return true
+		}
+		rem, ok := avail[id]
+		if !ok || rem < 0 {
+			return true // 未配置预算 = 不限
+		}
+		return rem-consumed[id] >= bytes
 	}
 	ids := make([]string, len(ring))
 	for i, b := range ring {
@@ -93,18 +169,43 @@ func (p *Planner) BlockLayout(objectID string, block int, ring []*DiskBackend) (
 		Backends: ids, S: p.s, R: p.r,
 	}
 	for sIdx := 0; sIdx < p.s; sIdx++ {
-		start := int(shardStartHash(objectID, block, sIdx) % uint32(len(ring)))
-		lay.Shards[sIdx] = make([]Placement, p.r)
-		for rIdx := 0; rIdx < p.r; rIdx++ {
-			bi := (start + rIdx) % len(ring)
-			lay.Shards[sIdx][rIdx] = Placement{
+		var shardBytes int64
+		if need != nil && sIdx < len(need) {
+			shardBytes = need[sIdx]
+		}
+		start := int(shardStartHash(objectID, block, sIdx) % uint32(L))
+		chosen := make([]Placement, 0, p.r)
+		usedHere := map[string]bool{}
+		for k := 0; k < L && len(chosen) < p.r; k++ {
+			b := expanded[(start+k)%L]
+			if usedHere[b.id] {
+				continue // 同一分片的副本必须在不同后端
+			}
+			if !fits(b.id, shardBytes) {
+				continue // 预算内放不下：确定性跳过
+			}
+			usedHere[b.id] = true
+			chosen = append(chosen, Placement{
 				Block:   block,
 				Shard:   sIdx,
-				Replica: rIdx,
-				Backend: ring[bi].id,
-				Path:    ShardPath(objectID, block, sIdx, rIdx),
+				Replica: len(chosen),
+				Backend: b.id,
+				Path:    ShardPath(objectID, block, sIdx, len(chosen)),
+			})
+		}
+		if len(chosen) < p.r {
+			return Layout{}, &PlacementError{
+				ObjectID: objectID, Block: block,
+				Shard: sIdx, Want: p.r, Healthy: len(ring),
+				Cause: ErrCapacityExhausted,
+				Decision: fmt.Sprintf("rule: distinct healthy backends (%d) >= R=%d, but budgets cannot fit shard %d (%d bytes/replica) for R replicas; block aborted before any byte written",
+					len(ring), p.r, sIdx, shardBytes),
 			}
 		}
+		for _, pl := range chosen {
+			consumed[pl.Backend] += shardBytes
+		}
+		lay.Shards[sIdx] = chosen
 	}
 	return lay, nil
 }
@@ -113,6 +214,8 @@ func (p *Planner) BlockLayout(objectID string, block int, ring []*DiskBackend) (
 // 布局计算永远基于"当前健康环"，不可用后端不会被选中，
 // 因此故障后端上不会静默放置新副本。
 func (p *Planner) HealthyBackends() []*DiskBackend {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	out := make([]*DiskBackend, 0, len(p.all))
 	for _, b := range p.all {
 		if b.Available() {
