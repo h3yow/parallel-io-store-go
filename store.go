@@ -551,7 +551,7 @@ func (s *Store) DescribeLayout(objectID string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "object=%s S=%d R=%d blocks=%d blockSize=%d visible=v%d/writer=%s\n",
 		objectID, s.cfg.Shards, s.cfg.Replicas, nBlocks, s.cfg.BlockSize, k.Version, k.Writer)
-	sb.WriteString("placement rule: shard s replicas at ring[(FNV1a(obj,b,s)+r) mod N] on healthy backend ring sorted by id; locations frozen in commit record\n")
+	sb.WriteString("placement rule: shard s replicas = first R distinct backends on weighted ring (smooth WRR expansion of healthy ring sorted by id, each backend repeated weight times) scanned from FNV1a(obj,b,s) mod L; locations depend only on (object,block,shard,R,backend config incl. weights) — never on current free space; capacity budgets only validate the fixed choice; locations frozen in commit record\n")
 	for b := 0; b < nBlocks; b++ {
 		rec, ok := s.recordFor(objectID, b, k)
 		if !ok {

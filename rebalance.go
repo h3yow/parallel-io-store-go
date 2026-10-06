@@ -5,9 +5,17 @@ package store
 // 语义：
 //   - AddBackend 只把新后端加入健康环，不迁移任何已有数据（向后兼容：
 //     旧数据、旧元数据、恢复流程完全不变）；
-//   - Rebalance 按当前健康环 + 容量/权重规则重算每个存活块的目标布局，
-//     逐个副本"先复制到目标位置并回读校验，再原子切换提交记录中的位置"，
-//     切换前旧副本继续服务读取，因此整个过程中读取不会失败；
+//   - Rebalance 按当前健康环 + 权重配置重算每个存活块的目标布局 ——
+//     目标布局与新写入使用同一条确定性规则，只取决于
+//     (对象, 块, 分片, 副本数, 后端配置)，与各后端当前剩余空间无关；
+//   - 迁移逐个副本"先复制到目标位置并回读校验，再原子切换提交记录中的
+//     位置"，切换前旧副本继续服务读取，因此整个过程中读取不会失败；
+//   - 容量判定与新写入一致：目标位置预算内放不下时**暂缓**该块的迁移
+//     （旧副本全部保留、照常可读，报告中记为 deferred），绝不硬塞导致
+//     任何后端超出预算；等条件允许（预算调高/空间释放）后再次
+//     Rebalance 即可继续；
+//   - 迁移前在同一把锁内对目标后端做容量预留（与写入路径共用同一本账），
+//     因此重平衡与并发写入同时发生时，任何后端已用+预留都不会超过预算；
 //   - 过程可中断、可重试、可重复触发：已切换的块重算后幂等跳过，
 //     中断留下的半成品复制文件不在存活集合内，由 GC 回收；
 //     最终收敛到同一个布局，不产生多余副本、不丢块；
@@ -26,6 +34,8 @@ type RebalanceReport struct {
 	CopiedReplicas   int    // 本轮实际复制并校验通过的副本数
 	UpdatedBlocks    int    // 本轮切换了新布局的块数
 	AlreadyConverged int    // 已在目标布局、无需任何动作的块数
+	DeferredBlocks   int    // 因目标位置容量不足而暂缓迁移的块数（旧副本保留）
+	DeferredMoves    int    // 被暂缓的副本迁移数
 	Reason           string // 判定依据文字说明
 }
 
@@ -113,19 +123,13 @@ func (s *Store) Rebalance() (*RebalanceReport, error) {
 	rep := &RebalanceReport{}
 	for _, rec := range recs {
 		need := shardSizes(rec.Size, s.cfg.Shards)
-		// 容量视图：把本块当前占用"还给"对应后端 —— 若目标位置与当前
-		// 相同则不需要新空间，避免"已收敛却因预算刚好占满而误报不足"。
-		s.mu.Lock()
-		avail := s.availableLocked()
-		s.mu.Unlock()
 		cur := map[locKey]string{}
 		for _, loc := range rec.Locs {
 			cur[locKey{loc.Shard, loc.Replica}] = loc.Backend
-			if v, ok := avail[loc.Backend]; ok && v >= 0 {
-				avail[loc.Backend] = v + shardSizeOf(rec.Size, s.cfg.Shards, loc.Shard)
-			}
 		}
-		layout, err := s.planner.BlockLayoutWithCapacity(rec.ObjectID, rec.Block, ring, need, avail)
+		// 目标布局：与新写入完全相同的确定性规则，不看任何容量/占用信息，
+		// 因此无论重平衡执行多少次、与多少并发写入交错，目标都一致。
+		layout, err := s.planner.BlockLayout(rec.ObjectID, rec.Block, ring)
 		if err != nil {
 			return rep, fmt.Errorf("rebalance: object=%s block=%d: %w", rec.ObjectID, rec.Block, err)
 		}
@@ -143,37 +147,88 @@ func (s *Store) Rebalance() (*RebalanceReport, error) {
 			rep.AlreadyConverged++
 			continue
 		}
-		// 逐副本迁移：复制 -> 回读校验 -> 全部就位后原子切换记录。
+		// 只迁移位置发生变化的副本；位置不变的副本不消耗任何新空间。
+		var moves []ReplicaLoc
 		for _, nl := range newLocs {
 			if cur[locKey{nl.Shard, nl.Replica}] == nl.Backend {
-				continue // 该副本位置不变
+				continue
 			}
-			rep.PlannedMoves++
+			moves = append(moves, nl)
+		}
+		rep.PlannedMoves += len(moves)
+		// 容量判定（与新写入同一本账、同一把锁）：目标后端预算内剩余
+		// 必须放得下待迁入的分片；放得下则立即预留，保证并发写入不会
+		// 把这份容量重复花掉；放不下则暂缓整块迁移 —— 旧副本全部保留、
+		// 照常可读，绝不为了完成重平衡把任何后端写爆。
+		s.mu.Lock()
+		avail := s.availableLocked()
+		fitsAll := true
+		consumed := map[string]int64{}
+		for _, mv := range moves {
+			bytes := need[mv.Shard]
+			rem, ok := avail[mv.Backend]
+			if !ok || rem < 0 {
+				continue // 目标后端未配置预算 = 不限
+			}
+			if rem-consumed[mv.Backend] < bytes {
+				fitsAll = false
+				break
+			}
+			consumed[mv.Backend] += bytes
+		}
+		if !fitsAll {
+			s.mu.Unlock()
+			rep.DeferredBlocks++
+			rep.DeferredMoves += len(moves)
+			continue
+		}
+		delta := Layout{Shards: make([][]Placement, s.cfg.Shards)}
+		for _, mv := range moves {
+			delta.Shards[mv.Shard] = append(delta.Shards[mv.Shard], Placement{
+				Block: rec.Block, Shard: mv.Shard, Replica: mv.Replica, Backend: mv.Backend,
+			})
+		}
+		s.reserveLocked(delta, need)
+		s.mu.Unlock()
+		release := func() {
+			s.mu.Lock()
+			s.releaseReservedLocked(delta, need)
+			s.mu.Unlock()
+		}
+		// 逐副本迁移：复制 -> 回读校验 -> 全部就位后原子切换记录。
+		copied := 0
+		for _, nl := range moves {
 			data, err := s.readShardCopy(rec, nl.Shard)
 			if err != nil {
+				release()
 				return rep, fmt.Errorf("rebalance: copy source: %w", err)
 			}
 			back := s.backends[nl.Backend]
 			if back == nil || !back.Available() {
+				release()
 				return rep, fmt.Errorf("rebalance: %w: target backend=%s", ErrBackendUnavailable, nl.Backend)
 			}
 			path := VersionedShardPath(rec.ObjectID, rec.Block, nl.Shard, nl.Replica, rec.Version, rec.Writer)
 			if err := back.Write(path, data); err != nil {
+				release()
 				return rep, fmt.Errorf("rebalance: write replica backend=%s path=%s: %w", nl.Backend, path, err)
 			}
 			// 回读校验：新副本未完整落盘且 CRC 正确之前，绝不切换记录。
 			got, err := back.Read(path)
 			if err != nil {
+				release()
 				return rep, fmt.Errorf("rebalance: verify read backend=%s path=%s: %w", nl.Backend, path, err)
 			}
 			if crc32.ChecksumIEEE(got) != rec.ShardCRC[nl.Shard] {
+				release()
 				return rep, fmt.Errorf("rebalance: verify crc backend=%s path=%s: %w", nl.Backend, path, ErrCheckpointCorrupt)
 			}
-			rep.CopiedReplicas++
+			copied++
 		}
 		newRec := rec
 		newRec.Locs = newLocs
 		if err := s.wal.Relocate(newRec); err != nil {
+			release()
 			return rep, fmt.Errorf("rebalance: switch layout: %w", err)
 		}
 		s.mu.Lock()
@@ -184,13 +239,17 @@ func (s *Store) Rebalance() (*RebalanceReport, error) {
 				break
 			}
 		}
+		// 提交记录已切换：占用改由已提交记账接管，释放在途预留。
+		s.releaseReservedLocked(delta, need)
 		s.mu.Unlock()
+		rep.CopiedReplicas += copied
 		rep.UpdatedBlocks++
 	}
 	rep.Reason = fmt.Sprintf(
-		"target layout recomputed deterministically on current healthy ring with capacity/weight rules; "+
-			"%d blocks already converged, %d blocks switched after copy+verify (%d replicas copied); "+
+		"target layout recomputed with the same deterministic rule as new writes (depends only on object/block/shard/R/backend config, never on current free space); "+
+			"%d blocks already converged, %d blocks switched after copy+verify (%d replicas copied), "+
+			"%d blocks deferred (%d replicas) because target budgets cannot fit yet — old replicas kept and readable, retry when capacity allows; "+
 			"old locations remain readable until switch and become GC garbage afterwards",
-		rep.AlreadyConverged, rep.UpdatedBlocks, rep.CopiedReplicas)
+		rep.AlreadyConverged, rep.UpdatedBlocks, rep.CopiedReplicas, rep.DeferredBlocks, rep.DeferredMoves)
 	return rep, nil
 }
