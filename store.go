@@ -80,6 +80,10 @@ type Store struct {
 	// 预留在容量预检通过时建立、提交或失败时释放，保证并发写入
 	// 不会把已承诺给他人的容量重复花掉（已提交数据绝不被挤占）。
 	reserved map[string]int64
+	// rebalMu 串行化重平衡：同一时刻至多一个 Rebalance 在执行，
+	// 保证容量增量判定中"即将释放的旧位置"不会被两趟重平衡重复
+	// 预支，从而让"已提交占用 <= 预算"成为全程成立的不变量。
+	rebalMu sync.Mutex
 	// repairs 记录读取自愈与巡检的补写事件（成功与失败都留痕）。
 	repairs []RepairEvent
 }
@@ -551,7 +555,7 @@ func (s *Store) DescribeLayout(objectID string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "object=%s S=%d R=%d blocks=%d blockSize=%d visible=v%d/writer=%s\n",
 		objectID, s.cfg.Shards, s.cfg.Replicas, nBlocks, s.cfg.BlockSize, k.Version, k.Writer)
-	sb.WriteString("placement rule: shard s replicas at ring[(FNV1a(obj,b,s)+r) mod N] on healthy backend ring sorted by id; locations frozen in commit record\n")
+	sb.WriteString("placement rule: shard s replicas = first R distinct backends on weighted ring (smooth weighted round-robin by configured weights) from position FNV1a(obj,b,s) mod L; positions depend only on (object, block, shard, R, backend set+weights) — capacity is checked after positions are fixed and never relocates them; locations frozen in commit record\n")
 	for b := 0; b < nBlocks; b++ {
 		rec, ok := s.recordFor(objectID, b, k)
 		if !ok {

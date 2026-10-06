@@ -12,9 +12,9 @@
 | 文件 | 职责 |
 | --- | --- |
 | `backend.go` | `DiskBackend`：本地目录模拟后端，原子写（临时文件+fsync+rename）与故障注入（写失败 / 下线 / 静默损坏） |
-| `placement.go` | 确定性分片与副本放置规则（加权环 + 容量约束）、路径规则 |
+| `placement.go` | 确定性分片与副本放置规则（加权环选位 + 选后容量判定）、路径规则 |
 | `store.go` | 存储层主逻辑：切块、条带化、并行副本写、原子提交、快照可见性、读重建、读自愈钩子 |
-| `capacity.go` | 后端容量预算与相对权重、写入前容量预检与预留、按后端的占用统计 |
+| `capacity.go` | 后端容量预算与相对权重、写入前容量预检与预留、重平衡容量增量判定、按后端的占用统计 |
 | `rebalance.go` | 在线加入后端、确定性重平衡（复制→校验→原子切换布局） |
 | `heal.go` | 读取自愈（补写既定位置）与全量巡检修复（`Scrub`） |
 | `wal.go` | 只追加提交日志（带 CRC 的帧、幂等折叠、撕裂尾帧压缩、位置取代记录） |
@@ -33,17 +33,22 @@
    加权环（权重 `w` 的后端在环上出现 `w` 次且均匀散开；全部权重为 1
    时加权环与原环逐元素相同）。分片 `s` 的副本选择：从加权环位置
    `FNV-1a(objectID, block, s) mod L` 起顺序扫描，依次挑出 `R` 个
-   "互不相同且预算内剩余容量足够"的后端（全权重 1 且无容量约束时，
-   等价于旧规则 `ring[(h + r) mod N]`，旧部署布局逐位不变）。
+   **互不相同**的后端（全权重 1 时等价于旧规则 `ring[(h + r) mod N]`，
+   旧部署布局逐位不变）。
 
-   - 位置只取决于 `(对象, 块, 分片, 副本, 当前健康环, 容量/权重配置)`，
-     与写入顺序、线程调度无关，因此任何时刻重算都得到同一布局；
-     权重只影响分布倾向，**不引入任何随机性**；
+   - 位置只取决于 `(对象, 块, 分片, 副本数, 当前健康环及其权重配置)`，
+     与写入顺序、线程调度、**各后端当前剩余空间**都无关，因此同一组
+     输入无论写多少次、以什么并发顺序写、各后端已被占掉多少空间，
+     算出的位置完全一致；权重只改变分布倾向，**不改变已确定的落点**，
+     也不引入任何随机性；
+   - **容量只用于判定，不参与选位**：位置固定之后，把本块落在每个
+     后端上的字节数与该后端预算内剩余比较——放得下才写，放不下整块
+     失败，**绝不因为某个后端当下剩余空间少就把副本挪到别的后端**；
    - 放置只在**当前健康**后端中选择，后端下线不会被静默放入副本；
    - 健康后端数 `< R` 时，**在写入任何字节之前**直接失败
      （`ErrReplicaShortage` + `PlacementError` 判定依据），绝不少放副本；
-   - 后端数量足够但容量预算放不下时，同样在写字节之前失败
-     （`ErrCapacityExhausted`，与前者可区分，见第 6 节）。
+   - 后端数量足够但这组已确定的位置在预算内放不下时，同样在写字节
+     之前失败（`ErrCapacityExhausted`，与前者可区分，见第 6 节）。
 5. 副本一旦随块提交，其后端位置会**冻结在提交记录**中。此后健康环成员
    变化，读取仍按提交时的固定位置寻址，不会发生副本漂移/错放。
 6. 分片文件按版本隔离存放，新版本写失败不可能覆盖旧版本副本：
@@ -56,7 +61,8 @@
 
 ```
 preflight(健康后端数 >= R；容量预检 + 预留，与冲突检查同一把锁)
-  → 计算确定性布局（加权环 + 容量约束）
+  → 计算确定性布局（加权环选位，位置与当前占用无关）
+  → 对这组已确定的位置做容量判定：放不下则整体失败
   → S*R 个副本并行写（每个副本都是临时文件+fsync+rename 的原子完整文件）
   → 任一副本失败：整块判定 ErrBlockIncomplete（聚合每个 *ShardWriteError），
     不追加提交记录；已落盘字节成为垃圾，等待 GC，绝不半提交
@@ -66,8 +72,8 @@ preflight(健康后端数 >= R；容量预检 + 预留，与冲突检查同一�
 容量预检在"声明写入键"的同一把锁内完成：先按当前生效提交集合算出各
 后端已用字节，加上在途写入的预留，再检查本次布局是否放得下；放不下
 则整体失败（`ErrCapacityExhausted`），**尚未写任何字节**。预留在提交
-或失败时释放。因此已提交数据占用的空间绝不会被后续写入挤占，也不会
-出现"写返回成功但某个副本其实没地方放"。
+或失败时释放。因此已提交数据占用的空间绝不会被后续写入或重平衡挤占，
+也不会出现"写返回成功但某个后端已用空间超过其预算"。
 
 只有 WAL 中存在提交记录的块才可见，因此读取永远观察不到"只写了一半的
 条带"或悬空副本。
@@ -129,13 +135,22 @@ preflight(健康后端数 >= R；容量预检 + 预留，与冲突检查同一�
 
 - 每个后端可用 `SetCapacity(budgetBytes, weight)` 配置容量预算
   （字节，`0` = 不限）与相对权重（`<1` 视为 `1`）；
-- 放置同时受两者约束：权重通过平滑加权轮转改变副本在环上的分布
-  倾向，预算通过"剩余容量不足则确定性跳过"约束选择；两者都是
-  纯函数，同一组输入（对象、块、分片、副本数、后端配置）无论写
-  多少次、以什么并发顺序写，算出的位置完全一致；
+- **权重只改变分布倾向，不改变已确定的落点**：权重通过平滑加权轮转
+  决定副本在环上的分布倾向，位置本身是
+  `(对象, 块, 分片, 副本数, 后端集合+权重)` 的纯函数——只要这组输入
+  不变，无论各后端当前被占掉多少空间、写多少次、以什么并发顺序写，
+  落点完全一致；
+- **容量只用于判定**：对已确定的位置检查"预算内剩余是否放得下"
+  （已用 + 在途预留 + 本次需要 ≤ 预算）。放得下才写；放不下整体失败，
+  不发生位置改换。判定与预留在同一把锁内完成，因此并发写入之间、
+  写入与重平衡之间都不会重复花费同一份容量，**任何后端的已提交
+  占用（Used）任何时候都不会超过预算**（重平衡为"同后端换位置"的
+  块会短暂预支即将释放的旧位置，`Used+Reserved` 可能瞬时略超预算，
+  差额以该块即将释放的旧位置字节为界，切换后即回到预算内）；
 - 失败原因可区分：健康后端数不够 → `ErrReplicaShortage`；
-  数量够但预算放不下 → `ErrCapacityExhausted`（都包在
-  `*PlacementError` 里，附判定依据）；
+  数量够但已确定的位置在预算内放不下 → `ErrCapacityExhausted`
+  （都包在 `*PlacementError` 里，附判定依据）；两者都发生在落盘
+  任何字节之前；
 - `CapacityReport()` 按后端返回 `Budget / Used / Reserved /
   Remaining`：`Used` 从当前生效提交集合精确推导，与 GC 之后
   `SpaceUsage()` 的磁盘实测逐字节相等（测试断言）。
@@ -145,20 +160,30 @@ preflight(健康后端数 >= R；容量预检 + 预留，与冲突检查同一�
 - `AddBackend(b)` 只把新后端加入健康环：**不迁移任何已有数据**，
   已有布局、已有元数据、恢复流程完全不变（向后兼容）；新写入
   可能落到新后端；
-- `Rebalance()` 做一次确定性重平衡：按当前健康环 + 容量/权重
-  规则重算每个存活块的目标布局，对每个需要迁移的副本执行
+- `Rebalance()` 做一次确定性重平衡：按当前健康环 + 权重配置重算
+  每个存活块的目标布局（目标位置是确定性的，与各后端当前剩余空间
+  无关），对每个需要迁移的副本执行
   **复制到目标位置 → 回读校验 CRC → 全部就位后用 WAL 位置取代
   记录原子切换该块布局**；
   - 切换发生之前旧副本继续服务读取，切换之后新副本已验证完好，
     因此整个过程中**读取不会失败**，内容、校验和与平衡前一致；
+  - **搬迁遵循与新写入一致的容量规则**：切换前先对目标位置做容量
+    增量判定并预留（`已用 - 释放 + 新增 + 预留 ≤ 预算`，与新写入
+    同一把锁、同一本账）。目标位置预算内放不下时**暂缓该块**
+    （`RebalanceReport.DeferredBlocks` 计数）：旧副本继续保留、
+    正常可读，一个字节都不硬塞，等条件允许（预算调高 / GC 回收
+    垃圾）后的下一轮再搬——绝不为了把重平衡跑完而把某个后端写爆；
   - 可中断、可重试、可重复触发：中断时未切换的块保持旧布局，
     半成品复制文件不在存活集合内（GC 回收）；重试从当前状态
-    继续，已收敛的块幂等跳过；最终收敛到同一个布局，不产生
-    多余副本、不丢块；
+    继续，已收敛的块幂等跳过、被暂缓的块每轮重试且暂缓集合确定；
+    最终收敛到同一个布局，不产生多余副本、不丢块；
   - 被取代的旧位置副本在切换后成为垃圾，由 `RunGC` 回收，
     回收后各后端占用等于当前存活副本集合；
   - 重平衡与普通读写并发（`opMu` 读锁），与 GC/Restore 互斥，
     保证复制期间旧副本不被回收、提交视图不被整体替换；
+    多趟重平衡之间由 `rebalMu` 串行化；
+  - 重平衡与并发写入叠加时，任何后端的已提交占用（Used）都不会
+    超过预算（测试以监视器协程全程断言）；
 - WAL 中的"位置取代"记录（同 Key、仅 `Locs` 不同）在重放时
   后来者生效，因此重启后重平衡结论依然成立；旧版本 WAL（无
   此类记录）重放行为不变。
@@ -219,6 +244,10 @@ go test ./... -race -count=10 -v
 - `TestCapacityExhaustedNoBytesWritten` /
   `TestShortageVsCapacityDistinguishable`：容量不足整体失败且不落
   任何字节，失败原因与"后端不足"可区分；
+- `TestPlacementIndependentOfOccupancy` /
+  `TestLayoutPureFunctionOfConfig`：同一输入在空盘/不均匀占用/
+  预算紧张（但够）下落点逐位一致；确定位置放不下时整体失败而
+  不是改换位置；规划器层面不同剩余空间视图算出同一布局；
 - `TestCapacityReportMatchesLiveData` /
   `TestCommittedDataNotEvictedByLaterWrites`：占用统计与存活数据
   严格一致，已提交数据不被后续写入挤占；
@@ -227,9 +256,13 @@ go test ./... -race -count=10 -v
 - `TestAddBackendWithoutRebalanceKeepsLayout` /
   `TestRebalanceConvergesAndIdempotent` /
   `TestRebalanceConcurrentReadWrite` /
-  `TestRebalanceInterruptRetryIdempotent`：只加后端不改旧布局；
+  `TestRebalanceInterruptRetryIdempotent` /
+  `TestConcurrentWriteAndRebalanceRespectBudgets` /
+  `TestRebalanceDefersWhenCapacityInsufficient`：只加后端不改旧布局；
   重平衡前后内容/校验和一致、并发读写下读取不失败、中断重试与
   重复执行幂等收敛、旧位置由 GC 回收且占用等于存活集合；
+  带预算时写入与重平衡并发，全程无任何后端超预算；
+  目标预算不足时暂缓该块、保留旧副本，预算放宽后收敛且幂等；
 - `TestReadSelfHealsCorruptReplica` /
   `TestReadSelfHealFailureDoesNotAffectRead` /
   `TestScrubReportsAndRepairs` /
@@ -241,7 +274,7 @@ go test ./... -race -count=10 -v
 
 ```
 object=o S=4 R=2 blocks=2 blockSize=16 visible=v8/writer-7
-placement rule: shard s replicas at ring[(FNV1a(obj,b,s)+r) mod N] ...
+placement rule: shard s replicas = first R distinct backends on weighted ring (smooth weighted round-robin by configured weights) from position FNV1a(obj,b,s) mod L; positions depend only on (object, block, shard, R, backend set+weights) — capacity is checked after positions are fixed and never relocates them; locations frozen in commit record
  block 0: size=16 crc=...
    shard=0 replica=0 backend=d path=shards/o/b0/v8-writer-7/s0/r0.data shardCRC=...
 ```

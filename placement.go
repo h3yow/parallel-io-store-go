@@ -126,39 +126,32 @@ func (p *Planner) BlockLayout(objectID string, block int, ring []*DiskBackend) (
 	return p.BlockLayoutWithCapacity(objectID, block, ring, nil, nil)
 }
 
-// BlockLayoutWithCapacity 在确定性规则上叠加容量约束计算块布局：
+// BlockLayoutWithCapacity 计算块布局，并在布局固定后做容量判定：
 //
 //   - need[shard] 为该分片单个副本的字节数；nil 表示不关心容量；
 //   - avail 为后端 ID -> 剩余可用字节（<0 表示不限）；nil 表示全部不限；
-//   - 选择规则：分片 s 从加权环位置 h(obj,block,s) mod L 起顺序扫描一整圈，
-//     依次挑出 R 个"互不相同且剩余容量足够"的后端；同一块内先被选中的
-//     分片会消耗对应后端的剩余容量（按分片号顺序，确定性）；
-//   - 全部权重为 1 且无容量约束时，结果与旧规则 ring[(h+r) mod N] 完全一致；
+//   - 选择规则（纯函数）：分片 s 从加权环位置 h(obj,block,s) mod L 起顺序
+//     扫描，依次挑出 R 个**互不相同**的后端。位置只取决于
+//     (对象, 块, 分片, 副本数, 后端集合及其权重配置)，与任何后端"当前
+//     剩余空间"无关 —— 同一组输入无论写多少次、以什么并发顺序写、
+//     各后端当前占用多少，算出的位置完全一致；
+//   - 容量判定发生在位置固定之后：把本块落在每个后端上的字节数汇总，
+//     与该后端预算内剩余比较；放不下则整块失败（ErrCapacityExhausted），
+//     **绝不因为某个后端当下剩余空间少就改换位置**；
+//   - 全部权重为 1 时，结果与旧规则 ring[(h+r) mod N] 完全一致；
 //   - 健康后端数 < R 时失败原因为 ErrReplicaShortage；后端数量足够但
-//     预算内放不下时为 ErrCapacityExhausted —— 两者可区分。
+//     这组已确定的位置在预算内放不下时为 ErrCapacityExhausted —— 两者可区分。
 func (p *Planner) BlockLayoutWithCapacity(objectID string, block int, ring []*DiskBackend, need []int64, avail map[string]int64) (Layout, error) {
 	if len(ring) < p.r {
 		return Layout{}, &PlacementError{
 			ObjectID: objectID, Block: block,
 			Shard: -1, Want: p.r, Healthy: len(ring),
 			Cause:    ErrReplicaShortage,
-			Decision: fmt.Sprintf("rule: shard s replica r -> first R distinct backends with enough budget on weighted ring from (h(obj,b,s)) ; N=%d healthy backends < R=%d", len(ring), p.r),
+			Decision: fmt.Sprintf("rule: shard s replica r -> first R distinct backends on weighted ring from h(obj,b,s); N=%d healthy backends < R=%d", len(ring), p.r),
 		}
 	}
 	expanded := weightedRing(ring)
 	L := len(expanded)
-	// 本块内已消耗的容量（在 avail 基础上递减，确定性）。
-	consumed := map[string]int64{}
-	fits := func(id string, bytes int64) bool {
-		if avail == nil || need == nil {
-			return true
-		}
-		rem, ok := avail[id]
-		if !ok || rem < 0 {
-			return true // 未配置预算 = 不限
-		}
-		return rem-consumed[id] >= bytes
-	}
 	ids := make([]string, len(ring))
 	for i, b := range ring {
 		ids[i] = b.id
@@ -168,11 +161,9 @@ func (p *Planner) BlockLayoutWithCapacity(objectID string, block int, ring []*Di
 		Shards:   make([][]Placement, p.s),
 		Backends: ids, S: p.s, R: p.r,
 	}
+	// 第一阶段：确定性选位。只跳过同分片内的重复后端，
+	// 容量完全不参与选择 —— 落点不随各后端当前占用变化。
 	for sIdx := 0; sIdx < p.s; sIdx++ {
-		var shardBytes int64
-		if need != nil && sIdx < len(need) {
-			shardBytes = need[sIdx]
-		}
 		start := int(shardStartHash(objectID, block, sIdx) % uint32(L))
 		chosen := make([]Placement, 0, p.r)
 		usedHere := map[string]bool{}
@@ -180,9 +171,6 @@ func (p *Planner) BlockLayoutWithCapacity(objectID string, block int, ring []*Di
 			b := expanded[(start+k)%L]
 			if usedHere[b.id] {
 				continue // 同一分片的副本必须在不同后端
-			}
-			if !fits(b.id, shardBytes) {
-				continue // 预算内放不下：确定性跳过
 			}
 			usedHere[b.id] = true
 			chosen = append(chosen, Placement{
@@ -193,19 +181,40 @@ func (p *Planner) BlockLayoutWithCapacity(objectID string, block int, ring []*Di
 				Path:    ShardPath(objectID, block, sIdx, len(chosen)),
 			})
 		}
-		if len(chosen) < p.r {
-			return Layout{}, &PlacementError{
-				ObjectID: objectID, Block: block,
-				Shard: sIdx, Want: p.r, Healthy: len(ring),
-				Cause: ErrCapacityExhausted,
-				Decision: fmt.Sprintf("rule: distinct healthy backends (%d) >= R=%d, but budgets cannot fit shard %d (%d bytes/replica) for R replicas; block aborted before any byte written",
-					len(ring), p.r, sIdx, shardBytes),
+		lay.Shards[sIdx] = chosen
+	}
+	// 第二阶段：容量判定。位置已固定，只检查这组位置在预算内放不放得下；
+	// 放不下就整体失败，而不是把副本挪到别的后端。
+	if need != nil && avail != nil {
+		want := map[string]int64{}
+		for sIdx := range lay.Shards {
+			var shardBytes int64
+			if sIdx < len(need) {
+				shardBytes = need[sIdx]
+			}
+			for _, pl := range lay.Shards[sIdx] {
+				want[pl.Backend] += shardBytes
 			}
 		}
-		for _, pl := range chosen {
-			consumed[pl.Backend] += shardBytes
+		for _, id := range ids { // ids 按后端 ID 有序，失败判定可复现
+			needBytes := want[id]
+			if needBytes == 0 {
+				continue
+			}
+			rem, ok := avail[id]
+			if !ok || rem < 0 {
+				continue // 未配置预算 = 不限
+			}
+			if rem < needBytes {
+				return Layout{}, &PlacementError{
+					ObjectID: objectID, Block: block,
+					Shard: -1, Want: p.r, Healthy: len(ring),
+					Cause: ErrCapacityExhausted,
+					Decision: fmt.Sprintf("rule: positions fixed by (object,block,shard,R,backend set+weights) only; backend=%s must hold %d bytes of this block but only %d bytes remain in its budget; block aborted before any byte written (capacity never relocates a determined position)",
+						id, needBytes, rem),
+				}
+			}
 		}
-		lay.Shards[sIdx] = chosen
 	}
 	return lay, nil
 }

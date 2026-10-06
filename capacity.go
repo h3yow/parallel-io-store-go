@@ -4,10 +4,11 @@ package store
 //
 // 语义：
 //   - 每个后端可配置容量预算（字节，0 表示不限）与相对权重（>=1）；
-//   - 放置副本时同时受"预算内剩余空间"与"权重分布倾向"约束，
-//     两者都是确定性的：同一组输入永远算出同一布局；
-//   - 已提交数据占用的空间不会被后续写入挤占：写入在落盘任何字节前
-//     先做容量预检并预留，预检失败整体失败；
+//   - 副本位置只由 (对象, 块, 分片, 副本数, 后端集合及其权重) 决定，
+//     与任何后端当前剩余空间无关；权重只改变分布倾向，不改变已确定的落点；
+//   - 容量只用于"判定"：这组已经确定的位置在预算内放不放得下。
+//     写入在落盘任何字节前先做容量预检并预留，预检失败整体失败；
+//     已提交数据占用的空间不会被后续写入或重平衡挤占；
 //   - 占用统计（预算/已用/预留/剩余）从"当前生效提交集合"精确推导，
 //     与磁盘上的存活数据严格一致。
 
@@ -110,6 +111,54 @@ func (s *Store) releaseReservedLocked(layout Layout, need []int64) {
 			if s.reserved[pl.Backend] == 0 {
 				delete(s.reserved, pl.Backend)
 			}
+		}
+	}
+}
+
+// tryReserveDeltaLocked 为重平衡中"一个块的布局切换"做容量判定与预留
+// （调用方须持有 s.mu）：
+//
+//   - adds[id] 为该块切换后将在后端 id 上新增的字节，
+//     removes[id] 为切换后从后端 id 上移除的字节（旧位置释放）；
+//   - 判定规则与新写入完全一致：对每个受影响后端，
+//     切换后的 已用 - 释放 + 新增 + 他人预留 不得超过其预算；
+//   - 全部放得下才建立预留（adds 计入 s.reserved）并返回 true；
+//     任一后端放不下则不改动任何状态、返回 false —— 调用方暂缓该块，
+//     旧副本继续保留并服务读取，绝不硬塞把后端写爆。
+func (s *Store) tryReserveDeltaLocked(adds, removes map[string]int64) bool {
+	used := s.usedLocked()
+	affected := map[string]bool{}
+	for id := range adds {
+		affected[id] = true
+	}
+	for id := range removes {
+		affected[id] = true
+	}
+	for id := range affected {
+		b, ok := s.backends[id]
+		if !ok {
+			return false // 目标后端不在当前配置中：放不下，暂缓
+		}
+		budget, _ := b.Capacity()
+		if budget <= 0 {
+			continue // 预算不限
+		}
+		if used[id]-removes[id]+adds[id]+s.reserved[id] > budget {
+			return false
+		}
+	}
+	for id, n := range adds {
+		s.reserved[id] += n
+	}
+	return true
+}
+
+// releaseDeltaLocked 释放 tryReserveDeltaLocked 建立的预留（调用方须持有 s.mu）。
+func (s *Store) releaseDeltaLocked(adds map[string]int64) {
+	for id, n := range adds {
+		s.reserved[id] -= n
+		if s.reserved[id] == 0 {
+			delete(s.reserved, id)
 		}
 	}
 }
